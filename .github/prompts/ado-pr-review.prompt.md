@@ -7,6 +7,7 @@ tools:
   - ado/repo_list_pull_request_threads
   - ado/repo_create_pull_request_thread
   - ado/repo_vote_pull_request
+  - ado/repo_list_directory
   - ado/repo_get_file_content
 ---
 
@@ -35,6 +36,7 @@ Optional flags the user may include in their request:
 - `--compare-to <id>` — diff against a specific older iteration.
 - `--focus <areas>` — comma-separated subset of `security,bugs,perf,tests,maintainability` (default: all).
 - `--max-findings <n>` — cap inline findings (default: 10).
+- `--repo-context <off|skeleton|deep>` — how much target-repo context to sample beyond the diff (default: `skeleton`). See "Sample target-repo context" below.
 
 If required input is missing, ask once and stop.
 
@@ -55,6 +57,45 @@ Capture: `title`, `description`, `sourceRefName`, `targetRefName`, `createdBy.di
 Call `repo_get_pull_request_changes` with `includeDiffs: true`, `includeLineContent: true`, `top: 100`. Pass `iterationId` / `compareTo` only if the user supplied `--iteration` / `--compare-to`.
 
 If the response indicates more files than fit in `top`, page with `skip += top` and concatenate. For PRs with > ~30 changed files or > ~3000 changed lines total, switch to **map-reduce** mode (Step 4b).
+
+### Sample target-repo context (`--repo-context`, default `skeleton`)
+
+The diff alone misses out-of-diff truths — existing utilities the PR may duplicate, project conventions, how changed code is wired in. This step adds light repo context under a strict token budget. Behavior depends on `--repo-context`:
+
+**`off`** — make zero extra calls. Skip directly to "Fetch existing threads". Use on giant monorepos where even the tree is expensive.
+
+**`skeleton`** (default) — make at most 3 cheap, best-effort calls (silently skip 404s):
+
+1. `repo_list_directory` with `path: "/"`, `recursive: true`, `recursionDepth: 3`, `version: <PR target branch ref short name>`, `versionType: "Branch"`. Do **not** page — the skeleton is meant to be cheap. Accept truncation if the response is large.
+2. `repo_get_file_content` for `/README.md` (fall back to `/README` then `/README.rst`). Cap to first ~200 lines; trim with `(truncated)` marker.
+3. One language-manifest probe, stopping at first hit: `/package.json`, `/pyproject.toml`, `/Cargo.toml`, `/go.mod`, `/pom.xml`, `/build.gradle.kts`, `/build.gradle`, `/composer.json`, `/Gemfile`. If none of those is at root, scan the skeleton tree for the first `*.csproj` and try that path. Cap to first ~200 lines.
+
+**`deep`** — first do the `skeleton` pass, then enable a one-round on-demand follow-up: when the analysis returns its draft JSON, if it includes a top-level `needs_file: ["/abs/path", ...]`, fetch each via `repo_get_file_content` (cap **5** files per run, dedupe, cap **400** lines per file, `versionType: "Branch"` on the source branch) and re-run the analysis exactly once with those files appended to the user prompt. Never loop more than once; drop `needs_file` from the second-round output.
+
+Build a `Repo context` block to prepend to the user prompt:
+
+```
+Repo context (mode: {{mode}}):
+=====
+Tree (depth 3, target branch):
+{{tree_lines}}
+
+README excerpt:
+{{readme_excerpt or "(not found)"}}
+
+Manifest ({{manifest_path or "none"}}):
+{{manifest_excerpt or "(not found)"}}
+{{#if extra_files}}
+
+Files fetched on demand (deep mode):
+{{#each extra_files}}--- {{path}} (lines 1-{{lines}}{{#if truncated}}, truncated{{/if}}) ---
+{{content}}
+{{/each}}
+{{/if}}
+=====
+```
+
+When `--repo-context off`, omit the entire block from the user prompt and skip the deep `needs_file` round.
 
 ### 3. Fetch existing threads (dedupe)
 
@@ -130,6 +171,27 @@ Anchor fields (Azure DevOps uses flat fields, not GitHub's start/end_line):
   unchanged or added line on the right side and reference the deletion in
   the prose. ADO's MCP tool does not expose left-side anchors.
 
+Using the `Repo context` block (when present):
+- A directory skeleton, README excerpt, and manifest excerpt may appear
+  ahead of the diff. Use them to (a) avoid flagging behavior an out-of-
+  diff file already handles, (b) flag duplication when the PR reimplements
+  a util visible elsewhere in the tree, (c) phrase findings in terms the
+  project's framework / language / layout already uses.
+- The skeleton is structural only (paths, no source). Do not invent file
+  contents from path names; if you need a file's body, request it via
+  `needs_file` (deep mode only).
+
+Deep-mode `needs_file` (only when `Repo context` mode is `deep`):
+- If you genuinely cannot judge a finding without reading a specific
+  file (a caller, an imported util, an existing test for the changed
+  behavior), include `"needs_file": ["/abs/path", ...]` at the top
+  level of your JSON output (max 5 paths, no duplicates, no files
+  already in the diff).
+- The orchestrator will fetch those files and re-run this prompt once
+  with their contents appended. Use sparingly — every listed file
+  costs tokens. If skeleton context is enough, omit `needs_file`.
+- On the second round, omit `needs_file` from the output.
+
 Output strictly the following JSON object — no prose, no markdown fences:
 
 {
@@ -150,7 +212,8 @@ Output strictly the following JSON object — no prose, no markdown fences:
     }
   ],
   "vote_recommendation": "Approved" | "Suggestions" | "Waiting" | "Rejected" | "None",
-  "vote_rationale": "One sentence explaining the recommendation."
+  "vote_rationale": "One sentence explaining the recommendation.",
+  "needs_file": ["/abs/path", ...]   // optional, deep mode only, max 5
 }
 
 Vote mapping guidance:
@@ -177,6 +240,8 @@ PR description:
 {{description or "(empty)"}}
 =====
 
+{{repo_context_block_or_empty}}
+
 Diff:
 =====
 {{normalized_diff}}
@@ -193,7 +258,7 @@ Return only the JSON object.
 If the PR exceeds ~30 files or ~3000 changed lines:
 
 1. Group files into batches of ≤ 8 files / ≤ 1500 lines each.
-2. Run the system prompt above per batch, but ask only for `key_issues` and `security_concerns`. Drop `score`, `estimated_effort_to_review`, `relevant_tests`, `vote_recommendation` from per-batch output.
+2. Run the system prompt above per batch, but ask only for `key_issues` and `security_concerns`. Drop `score`, `estimated_effort_to_review`, `relevant_tests`, `vote_recommendation` from per-batch output. Prepend the same `Repo context` block to every batch (it does not vary).
 3. After all batches return, run a **synthesis pass** that:
    - takes the merged `key_issues[]` (deduped by `filePath` + `rightFileStartLine`),
    - asks the model to compute `score`, `estimated_effort_to_review`, `relevant_tests`, `vote_recommendation`, `vote_rationale`,
@@ -323,6 +388,7 @@ What you return to the user (regardless of whether they confirmed posting):
 - **Cap findings.** Default `max_findings` is 10. The prompt sorts by severity so low-priority items are dropped first.
 - **Map-reduce honestly.** When the diff is too large for one shot, say so in the summary block (`(reviewed in {{n}} batches; cross-file effects may be missed)`).
 - **No PII / secrets in comment bodies.** If the model emits an apparent secret or token in `issue_content`, redact before posting.
+- **Repo-context budget.** `skeleton` mode caps repo calls at 3 (tree + README + manifest); `deep` mode adds at most one re-run with up to 5 on-demand files (≤ 400 lines each). Never loop a second `needs_file` round — drop unfetched requests with a note.
 
 ---
 

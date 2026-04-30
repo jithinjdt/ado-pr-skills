@@ -5,6 +5,8 @@ tools:
   - ado/repo_get_pull_request_by_id
   - ado/repo_get_pull_request_changes
   - ado/repo_update_pull_request
+  - ado/repo_list_directory
+  - ado/repo_get_file_content
 ---
 
 # Describe Azure DevOps PR
@@ -32,6 +34,7 @@ Optional flags:
 - `--update-labels` — opt in to managing labels (off by default; ADO replaces the full label set, so this is risky).
 - `--include-walkthrough` — add a per-file walkthrough section (default: on).
 - `--no-walkthrough` — skip the per-file walkthrough.
+- `--repo-context <off|skeleton|deep>` — how much target-repo context to sample beyond the diff (default: `skeleton`). See "Sample target-repo context" below. `deep` rarely helps for descriptions; `skeleton` is usually plenty.
 
 If required input is missing, ask once and stop.
 
@@ -50,6 +53,45 @@ Capture: `title`, `description`, `sourceRefName`, `targetRefName`, `createdBy.di
 ### 2. Fetch the diff
 
 Call `repo_get_pull_request_changes` with `includeDiffs: true`, `includeLineContent: true`, `top: 100`. Page if needed. For PRs > ~30 files or > ~3000 changed lines, use map-reduce mode (Step 3b).
+
+### Sample target-repo context (`--repo-context`, default `skeleton`)
+
+The diff alone misses out-of-diff truths — what kind of project this is, what frameworks it uses, what conventions reviewers expect in the description. This step adds light repo context under a strict token budget. Behavior depends on `--repo-context`:
+
+**`off`** — make zero extra calls. Skip directly to "Run description generation". Use on giant monorepos where even the tree is expensive.
+
+**`skeleton`** (default) — make at most 3 cheap, best-effort calls (silently skip 404s):
+
+1. `repo_list_directory` with `path: "/"`, `recursive: true`, `recursionDepth: 3`, `version: <PR target branch ref short name>`, `versionType: "Branch"`. Do **not** page — the skeleton is meant to be cheap.
+2. `repo_get_file_content` for `/README.md` (fall back to `/README` then `/README.rst`). Cap to first ~200 lines; trim with `(truncated)` marker.
+3. One language-manifest probe, stopping at first hit: `/package.json`, `/pyproject.toml`, `/Cargo.toml`, `/go.mod`, `/pom.xml`, `/build.gradle.kts`, `/build.gradle`, `/composer.json`, `/Gemfile`. If none of those is at root, scan the skeleton tree for the first `*.csproj` and try that path. Cap to first ~200 lines.
+
+**`deep`** — first do the `skeleton` pass, then enable a one-round on-demand follow-up: when generation returns its draft JSON, if it includes a top-level `needs_file: ["/abs/path", ...]`, fetch each via `repo_get_file_content` (cap **5** files per run, dedupe, cap **400** lines per file, `versionType: "Branch"` on the source branch) and re-run generation exactly once with those files appended. Never loop more than once. (For descriptions, `needs_file` is rarely needed — the model should usually leave it empty.)
+
+Build a `Repo context` block to prepend to the user prompt:
+
+```
+Repo context (mode: {{mode}}):
+=====
+Tree (depth 3, target branch):
+{{tree_lines}}
+
+README excerpt:
+{{readme_excerpt or "(not found)"}}
+
+Manifest ({{manifest_path or "none"}}):
+{{manifest_excerpt or "(not found)"}}
+{{#if extra_files}}
+
+Files fetched on demand (deep mode):
+{{#each extra_files}}--- {{path}} (lines 1-{{lines}}{{#if truncated}}, truncated{{/if}}) ---
+{{content}}
+{{/each}}
+{{/if}}
+=====
+```
+
+When `--repo-context off`, omit the entire block from the user prompt and skip the deep `needs_file` round.
 
 ### 3a. Run description generation (single-shot)
 
@@ -99,6 +141,23 @@ Risk callouts (only if applicable):
 - Phrase as a short heads-up to reviewers, not as concerns about
   correctness — that is the reviewer's job.
 
+Using the `Repo context` block (when present):
+- A directory skeleton, README excerpt, and manifest excerpt may appear
+  ahead of the diff. Use them to identify the project type, frameworks,
+  and conventions (e.g. "Next.js app", "Go module", ".NET service") so
+  the description uses terminology reviewers will recognize. Don't pad
+  the description with project-overview prose — the audience already
+  knows the repo.
+- The skeleton is paths only. Don't invent file contents from path
+  names; if you genuinely need a body to describe a change, request it
+  via `needs_file` (deep mode only — usually unnecessary for describe).
+
+Deep-mode `needs_file` (only when `Repo context` mode is `deep`):
+- Optional. Include `"needs_file": ["/abs/path", ...]` (max 5, no
+  duplicates, no files already in the diff) only if reading a specific
+  file would meaningfully change the description. The orchestrator
+  fetches and re-runs once. Most descriptions should leave this empty.
+
 Output strictly the following JSON object — no prose, no markdown fences:
 
 {
@@ -111,7 +170,8 @@ Output strictly the following JSON object — no prose, no markdown fences:
     ...
   ],
   "risk_callouts": ["bullet", ...] ,
-  "suggested_labels": ["bug", "tests", ...]
+  "suggested_labels": ["bug", "tests", ...],
+  "needs_file": ["/abs/path", ...]   // optional, deep mode only, max 5
 }
 ```
 
@@ -124,6 +184,8 @@ Source branch: {{sourceRefName}}
 Target branch: {{targetRefName}}
 Author: {{createdBy}}
 Linked work items: {{workItemRefs or "none"}}
+
+{{repo_context_block_or_empty}}
 
 Diff:
 =====
@@ -140,7 +202,7 @@ Return only the JSON object.
 If > ~30 files or > ~3000 changed lines:
 
 1. Group files into batches of ≤ 8 files / ≤ 1500 lines.
-2. For each batch, ask only for `walkthrough[]` and `risk_callouts[]`.
+2. For each batch, ask only for `walkthrough[]` and `risk_callouts[]`. Prepend the same `Repo context` block to every batch (it does not vary).
 3. Synthesis pass: merge walkthroughs (dedupe by path), generate the final `title`, `type`, `summary`, `suggested_labels` from the merged walkthrough.
 4. Note in the description that it was generated in batches.
 
@@ -258,6 +320,7 @@ What you return to the user:
 - **Don't fabricate work items.** If `workItemRefs` is empty, do not invent IDs in the title or description.
 - **Map-reduce honestly.** If batched, say so in the description footer.
 - **No PII / secrets.** If the diff contains apparent tokens, redact in the rendered description.
+- **Repo-context budget.** `skeleton` mode caps repo calls at 3 (tree + README + manifest); `deep` mode adds at most one re-run with up to 5 on-demand files (≤ 400 lines each). For describe, `deep` is rarely worth the extra tokens.
 
 ---
 

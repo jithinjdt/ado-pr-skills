@@ -55,6 +55,7 @@ These appear on most skills (see each prompt file for the full list):
 - `--compare-to <id>` — diff against a specific older iteration.
 - `--focus <areas>` — comma-separated subset of focus areas (skills define their own sets).
 - `--max-findings <n>` / `--max-suggestions <n>` / `--max-scenarios <n>` — cap output.
+- `--repo-context <off|skeleton|deep>` — how much target-repo context to sample beyond the diff. Default `skeleton` makes at most 3 cheap calls (directory tree at depth 3 + README excerpt + language manifest) so the skill knows the project's shape, not just the patch. `deep` adds one round of on-demand file fetches (≤ 5 files, ≤ 400 lines each) when the model flags `needs_file` to resolve uncertainty. `off` is for giant monorepos where even the tree is expensive.
 
 Skill-specific flags worth knowing:
 

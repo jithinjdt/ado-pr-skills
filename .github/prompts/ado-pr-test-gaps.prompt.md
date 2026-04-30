@@ -38,6 +38,7 @@ Optional flags:
 - `--no-work-items` — skip fetching linked work items even when `wit` is available.
 - `--iteration <id>` — analyze a specific iteration.
 - `--compare-to <id>` — compare against a specific older iteration.
+- `--repo-context <off|skeleton|deep>` — how much target-repo context to sample beyond the diff (default: `skeleton`). See "Sample target-repo context" below. The existing test-discovery in Step 4 reuses the skeleton tree.
 
 If required input is missing, ask once and stop.
 
@@ -63,6 +64,45 @@ Call `wit_get_work_items_batch_by_ids` with the work-item IDs. Use the returned 
 
 If `wit` is not in the registered toolset, skip this step and note in the final output: "Linked work items present but `wit` toolset not registered — analysis is based on diff alone."
 
+### Sample target-repo context (`--repo-context`, default `skeleton`)
+
+The diff alone misses out-of-diff truths — what kind of project this is, where tests live, what testing framework is in use. This step adds light repo context under a strict token budget. Behavior depends on `--repo-context`:
+
+**`off`** — make zero extra calls. Skip directly to "Locate test files" and operate from the diff alone (no auto-detection of test roots).
+
+**`skeleton`** (default) — make at most 3 cheap, best-effort calls (silently skip 404s):
+
+1. `repo_list_directory` with `path: "/"`, `recursive: true`, `recursionDepth: 3`, `version: <PR target branch ref short name>`, `versionType: "Branch"`. Do **not** page.
+2. `repo_get_file_content` for `/README.md` (fall back to `/README` then `/README.rst`). Cap to first ~200 lines.
+3. One language-manifest probe, stopping at first hit: `/package.json`, `/pyproject.toml`, `/Cargo.toml`, `/go.mod`, `/pom.xml`, `/build.gradle.kts`, `/build.gradle`, `/composer.json`, `/Gemfile`. If none of those is at root, scan the skeleton tree for the first `*.csproj`. Cap to first ~200 lines.
+
+**`deep`** — first do the `skeleton` pass, then enable a one-round on-demand follow-up: when gap analysis returns its draft JSON, if it includes a top-level `needs_file: ["/abs/path", ...]`, fetch each via `repo_get_file_content` (cap **5** files per run, dedupe, cap **400** lines per file, source branch) and re-run analysis exactly once. For test-gaps, the typical use is fetching an existing test file's body to confirm whether it covers a behavior — without that, the analysis can only mark `uncertain`.
+
+Build a `Repo context` block to prepend to the user prompt:
+
+```
+Repo context (mode: {{mode}}):
+=====
+Tree (depth 3, target branch):
+{{tree_lines}}
+
+README excerpt:
+{{readme_excerpt or "(not found)"}}
+
+Manifest ({{manifest_path or "none"}}):
+{{manifest_excerpt or "(not found)"}}
+{{#if extra_files}}
+
+Files fetched on demand (deep mode):
+{{#each extra_files}}--- {{path}} (lines 1-{{lines}}{{#if truncated}}, truncated{{/if}}) ---
+{{content}}
+{{/each}}
+{{/if}}
+=====
+```
+
+When `--repo-context off`, omit this block entirely.
+
 ### 4. Locate test files
 
 Classify each changed file in the diff:
@@ -74,10 +114,10 @@ Classify each changed file in the diff:
 Then locate the **test root(s)** for the repo:
 
 - If `--test-dirs` was provided, use those paths.
-- Else, call `repo_list_directory` at `/` with `recursive: false` to find top-level dirs. If a `tests/` or `test/` exists, use it. Otherwise, look for language-conventional locations (`src/__tests__/`, `pkg/.../*_test.go`, etc.) by listing one level deeper at suspect dirs.
+- Else, **reuse the skeleton tree** fetched in the previous step (when `--repo-context` is `skeleton` or `deep`) — scan it for `tests/`, `test/`, `__tests__/`, `spec/` directories or language-conventional locations (`pkg/.../*_test.go`, `src/**/*.test.*`, etc.). Only if `--repo-context off` was passed (so no skeleton was fetched), fall back to `repo_list_directory` at `/` with `recursive: false`, then list one level deeper at suspect dirs.
 - For each production file in the diff, derive the *expected* test path using the language-specific convention and call `repo_get_file_content` to check whether that test file exists. Treat a 404 / not-found as a strong signal that no test exists for that file.
 
-Limit total `repo_list_directory` and `repo_get_file_content` calls to ~15 — do not exhaustively crawl the repo.
+Limit total `repo_list_directory` and `repo_get_file_content` calls in this step to ~12 — the skeleton already covered the structural lookup, so most of this budget is for per-file existence checks.
 
 ### 5. Run gap analysis
 
@@ -136,6 +176,25 @@ Linked work items (if provided):
   satisfy. If a work item describes a scenario that has no test in the
   PR diff, that is a gap.
 
+Using the `Repo context` block (when present):
+- A directory skeleton, README excerpt, and manifest excerpt may appear
+  ahead of the diff. Use them to identify the testing framework
+  (Jest/Vitest/pytest/Go test/JUnit/etc.) so suggested scenarios use
+  matching idioms, and to spot test directories the project already
+  has. The skeleton is paths only — it confirms files exist but not
+  their content.
+- In `deep` mode, "Files fetched on demand" may include actual existing
+  test bodies. If a test body is provided, use it to upgrade
+  `test_path_exists` and to drop gaps that the existing test clearly
+  covers.
+
+Deep-mode `needs_file` (only when `Repo context` mode is `deep`):
+- If you cannot decide whether an existing test file covers a behavior
+  without seeing it, include `"needs_file": ["/abs/path", ...]` at the
+  top level of your JSON output (max 5 paths, no duplicates, no files
+  already in the diff). The orchestrator fetches and re-runs once.
+- On the second round, omit `needs_file`.
+
 Output strictly the following JSON object — no prose, no markdown fences:
 
 {
@@ -174,7 +233,8 @@ Output strictly the following JSON object — no prose, no markdown fences:
     "high_severity_gaps": N,
     "overall_assessment": "well_tested" | "partially_tested" |
                          "undertested" | "no_tests"
-  }
+  },
+  "needs_file": ["/abs/path", ...]   // optional, deep mode only, max 5
 }
 ```
 
@@ -184,6 +244,8 @@ Output strictly the following JSON object — no prose, no markdown fences:
 PR title: {{title}}
 Source branch: {{sourceRefName}}
 Target branch: {{targetRefName}}
+
+{{repo_context_block_or_empty}}
 
 Diff:
 =====
@@ -296,7 +358,8 @@ What you return to the user:
 
 - **Never auto-post.** Always show the report and ask before calling `repo_create_pull_request_thread`.
 - **Refuse abandoned/completed PRs.**
-- **Bounded directory crawling.** Cap `repo_list_directory` + `repo_get_file_content` at ~15 calls. Test discovery is a hint, not a guarantee.
+- **Bounded directory crawling.** Cap `repo_list_directory` + `repo_get_file_content` at ~15 calls *for Step 4*, on top of the ≤ 3 calls the skeleton step makes. Test discovery is a hint, not a guarantee.
+- **Repo-context budget.** `skeleton` mode caps repo calls at 3 (tree + README + manifest); `deep` mode adds at most one re-run with up to 5 on-demand files (≤ 400 lines each). Never loop a second `needs_file` round.
 - **Don't fabricate scenarios.** If a behavior is unclear from the diff, mark `uncertain` rather than inventing one. The model should err toward fewer, sharper gaps over many vague ones.
 - **Don't claim coverage that you cannot verify.** If you didn't fetch the body of an existing test file, you cannot assert that it covers a scenario; only the test files added in *this PR* count as concretely covered.
 - **Skip refactoring-only files.** If a file's diff is purely renames or type tweaks with no behavior change, do not flag missing tests for it.

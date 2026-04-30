@@ -6,6 +6,7 @@ tools:
   - ado/repo_get_pull_request_changes
   - ado/repo_create_pull_request_thread
   - ado/repo_reply_to_comment
+  - ado/repo_list_directory
   - ado/repo_get_file_content
 ---
 
@@ -37,6 +38,7 @@ Optional flags:
 - `--anchor <path>:<line>` or `--anchor <path>:<startLine>-<endLine>` — post as an anchored thread on a specific file/line range (implies `--post`).
 - `--iteration <id>` — answer based on a specific iteration.
 - `--compare-to <id>` — compare against a specific older iteration.
+- `--repo-context <off|skeleton|deep>` — how much target-repo context to sample beyond the diff (default: `skeleton`). See "Sample target-repo context" below. The existing Step 3 (conditional `repo_get_file_content`) is the `deep`-mode follow-up loop.
 
 If required input is missing (PR or question), ask once and stop.
 
@@ -54,11 +56,52 @@ If `status` is `abandoned` or `completed`, **still answer the question** (a ques
 
 Call `repo_get_pull_request_changes` with `includeDiffs: true`, `includeLineContent: true`, `top: 100`. Pass `iterationId` / `compareTo` if the user supplied them. Page if needed.
 
-### 3. (Conditional) Fetch surrounding file context
+### Sample target-repo context (`--repo-context`, default `skeleton`)
+
+The diff alone misses out-of-diff truths the question may depend on — what kind of project this is, where the answer lives in the broader code. This step adds light repo context under a strict token budget. Behavior depends on `--repo-context`:
+
+**`off`** — make zero extra calls. Skip both this step and Step 3. Answer from the diff alone, and if the question can't be answered from the diff, say so.
+
+**`skeleton`** (default) — make at most 3 cheap, best-effort calls (silently skip 404s):
+
+1. `repo_list_directory` with `path: "/"`, `recursive: true`, `recursionDepth: 3`, `version: <PR target branch ref short name>`, `versionType: "Branch"`. Do **not** page.
+2. `repo_get_file_content` for `/README.md` (fall back to `/README` then `/README.rst`). Cap to first ~200 lines.
+3. One language-manifest probe, stopping at first hit: `/package.json`, `/pyproject.toml`, `/Cargo.toml`, `/go.mod`, `/pom.xml`, `/build.gradle.kts`, `/build.gradle`, `/composer.json`, `/Gemfile`. If none of those is at root, scan the skeleton tree for the first `*.csproj`. Cap to first ~200 lines.
+
+**`deep`** — first do the `skeleton` pass, then perform Step 3 (conditional file fetch) as the follow-up. In `deep` mode, when the question references files outside the diff, the model may also emit a one-line marker `NEEDS_FILE: /abs/path1, /abs/path2` (max 5 paths) at the top of its draft answer; the orchestrator fetches these via `repo_get_file_content` (cap 5, ≤ 400 lines each, dedupe, source-branch), removes the marker, appends the contents to the user prompt, and re-runs the answer step exactly once.
+
+Build a `Repo context` block to prepend to the user prompt:
+
+```
+Repo context (mode: {{mode}}):
+=====
+Tree (depth 3, target branch):
+{{tree_lines}}
+
+README excerpt:
+{{readme_excerpt or "(not found)"}}
+
+Manifest ({{manifest_path or "none"}}):
+{{manifest_excerpt or "(not found)"}}
+{{#if extra_files}}
+
+Files fetched on demand (deep mode):
+{{#each extra_files}}--- {{path}} (lines 1-{{lines}}{{#if truncated}}, truncated{{/if}}) ---
+{{content}}
+{{/each}}
+{{/if}}
+=====
+```
+
+When `--repo-context off`, omit this block and skip Step 3.
+
+### 3. (Conditional) Fetch surrounding file context — only when `--repo-context deep`
 
 If the question references symbols, behaviors, or files **outside the diff**, or if a confident answer requires understanding pre-existing code, call `repo_get_file_content` for the relevant file(s). Use `versionType: "Branch"` with the source branch.
 
-Be parsimonious — fetch only files the question clearly depends on. If you fetched > 3 files, mention that in the answer.
+Be parsimonious — fetch only files the question clearly depends on. Cap at 5 files, ≤ 400 lines per file. If you fetched > 3 files, mention that in the answer.
+
+In `skeleton` mode this step is **skipped**; the model answers using only the skeleton block plus the diff. If the question requires a specific file the model can't see, the model says so explicitly in its answer and suggests re-running with `--repo-context deep`.
 
 ### 4. Run the answer
 
@@ -90,6 +133,24 @@ Answer style:
 - Do not editorialize about code quality unless the question asks about
   it. This is `ask`, not `review` — stay scoped to the user's question.
 
+Using the `Repo context` block (when present):
+- A directory skeleton, README excerpt, and manifest excerpt may appear
+  ahead of the diff. Treat them as orientation: the project type, where
+  things live, what frameworks are in play. They are not source content
+  you can quote (the skeleton is paths only). If the question asks
+  something a path implies but you can't verify, say so.
+- In `deep` mode, a "Files fetched on demand" subsection may include
+  actual file bodies; you may quote those.
+
+Deep-mode `NEEDS_FILE` (only when `Repo context` mode is `deep`):
+- If the question genuinely cannot be answered without seeing a specific
+  out-of-diff file, emit a single line at the very top of your draft
+  answer: `NEEDS_FILE: /abs/path1, /abs/path2` (max 5 paths, no
+  duplicates, no files already in the diff). The orchestrator fetches
+  those files, strips the marker, appends contents to the prompt, and
+  re-runs this step once. On the second round, do NOT emit the marker
+  again — answer with what you have.
+
 Output a markdown answer (NOT JSON). Length budget: aim for under 400
 words unless the question genuinely requires more. Use:
 - A direct one-paragraph answer at the top.
@@ -107,14 +168,17 @@ Source branch: {{sourceRefName}}
 Target branch: {{targetRefName}}
 Linked work items: {{workItemRefs or "none"}}
 
+{{repo_context_block_or_empty}}
+
 Diff:
 =====
 {{normalized_diff}}
 =====
 
 {{#if extra_file_context}}
-Additional file context (fetched via repo_get_file_content because the
-question references code outside the diff):
+Additional file context (Step 3, deep mode only, fetched via
+repo_get_file_content because the question references code outside the
+diff):
 =====
 {{extra_file_context}}
 =====
@@ -194,6 +258,7 @@ What you return to the user:
 - **No PII / secrets.** If the diff contains apparent tokens, redact in the answer.
 - **No vote.** This skill never calls `repo_vote_pull_request`.
 - **Length discipline.** Aim under ~400 words. Long-form analysis belongs in `ado-pr-review`.
+- **Repo-context budget.** `skeleton` mode caps repo calls at 3 (tree + README + manifest); `deep` mode adds Step 3 (parsimonious file fetch) plus at most one `NEEDS_FILE` re-run with up to 5 files (≤ 400 lines each). Never loop a second `NEEDS_FILE` round.
 
 ---
 

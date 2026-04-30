@@ -6,6 +6,7 @@ tools:
   - ado/repo_get_pull_request_changes
   - ado/repo_list_pull_request_threads
   - ado/repo_create_pull_request_thread
+  - ado/repo_list_directory
   - ado/repo_get_file_content
 ---
 
@@ -36,6 +37,7 @@ Optional flags:
 - `--iteration <id>` — target a specific iteration.
 - `--compare-to <id>` — diff against a specific older iteration.
 - `--no-code-blocks` — describe the change in prose only, do not include suggested code (default: include code blocks).
+- `--repo-context <off|skeleton|deep>` — how much target-repo context to sample beyond the diff (default: `skeleton`). See "Sample target-repo context" below.
 
 If required input is missing, ask once and stop.
 
@@ -53,7 +55,46 @@ Refuse and explain if `status` is `abandoned` or `completed`. If `isDraft: true`
 
 Call `repo_get_pull_request_changes` with `includeDiffs: true`, `includeLineContent: true`, `top: 100`. Pass `iterationId` / `compareTo` if the user provided them. Page if needed. For PRs > ~30 files or > ~3000 changed lines, use map-reduce mode (Step 4b).
 
-Optionally, for each file with substantial new code, call `repo_get_file_content` to fetch surrounding context that is not in the diff. Only do this when a suggestion clearly depends on understanding pre-existing code.
+Optionally, for each file with substantial new code, call `repo_get_file_content` to fetch surrounding context that is not in the diff. Only do this when a suggestion clearly depends on understanding pre-existing code. (Most "I need a specific file" cases should instead go through the `--repo-context deep` `needs_file` flow described next, which is bounded.)
+
+### Sample target-repo context (`--repo-context`, default `skeleton`)
+
+The diff alone misses out-of-diff truths — existing utilities the PR may duplicate, project conventions, how changed code is wired in. This step adds light repo context under a strict token budget. Behavior depends on `--repo-context`:
+
+**`off`** — make zero extra calls. Skip directly to "Fetch existing threads". Use on giant monorepos where even the tree is expensive.
+
+**`skeleton`** (default) — make at most 3 cheap, best-effort calls (silently skip 404s):
+
+1. `repo_list_directory` with `path: "/"`, `recursive: true`, `recursionDepth: 3`, `version: <PR target branch ref short name>`, `versionType: "Branch"`. Do **not** page — the skeleton is meant to be cheap.
+2. `repo_get_file_content` for `/README.md` (fall back to `/README` then `/README.rst`). Cap to first ~200 lines; trim with `(truncated)` marker.
+3. One language-manifest probe, stopping at first hit: `/package.json`, `/pyproject.toml`, `/Cargo.toml`, `/go.mod`, `/pom.xml`, `/build.gradle.kts`, `/build.gradle`, `/composer.json`, `/Gemfile`. If none of those is at root, scan the skeleton tree for the first `*.csproj` and try that path. Cap to first ~200 lines.
+
+**`deep`** — first do the `skeleton` pass, then enable a one-round on-demand follow-up: when the analysis returns its draft JSON, if it includes a top-level `needs_file: ["/abs/path", ...]`, fetch each via `repo_get_file_content` (cap **5** files per run, dedupe, cap **400** lines per file, `versionType: "Branch"` on the source branch) and re-run the analysis exactly once with those files appended to the user prompt. Never loop more than once; drop `needs_file` from the second-round output.
+
+Build a `Repo context` block to prepend to the user prompt:
+
+```
+Repo context (mode: {{mode}}):
+=====
+Tree (depth 3, target branch):
+{{tree_lines}}
+
+README excerpt:
+{{readme_excerpt or "(not found)"}}
+
+Manifest ({{manifest_path or "none"}}):
+{{manifest_excerpt or "(not found)"}}
+{{#if extra_files}}
+
+Files fetched on demand (deep mode):
+{{#each extra_files}}--- {{path}} (lines 1-{{lines}}{{#if truncated}}, truncated{{/if}}) ---
+{{content}}
+{{/each}}
+{{/if}}
+=====
+```
+
+When `--repo-context off`, omit the entire block from the user prompt and skip the deep `needs_file` round.
 
 ### 3. Fetch existing threads (dedupe)
 
@@ -125,6 +166,26 @@ Anchor fields (Azure DevOps flat fields, not GitHub's start/end_line):
 - `rightFileEndOffset` will be set to 9999 (ADO clamps to end-of-line).
 - For a single-line suggestion, set start and end equal.
 
+Using the `Repo context` block (when present):
+- A directory skeleton, README excerpt, and manifest excerpt may appear
+  ahead of the diff. Use them to (a) avoid suggesting code the project
+  has already factored into a util, (b) suggest reusing the existing
+  util when the PR reimplements it, (c) match the project's framework
+  / language / layout conventions instead of guessing.
+- The skeleton is paths only, not source. Do not invent file contents
+  from path names; if you need a body, request it via `needs_file`
+  (deep mode only).
+
+Deep-mode `needs_file` (only when `Repo context` mode is `deep`):
+- If you genuinely cannot finalize a suggestion without seeing a
+  specific file (the existing util you'd point to, the caller, the
+  type definition), include `"needs_file": ["/abs/path", ...]` at
+  the top level of your JSON output (max 5 paths, no duplicates, no
+  files already in the diff).
+- The orchestrator will fetch those files and re-run this prompt once
+  with them appended. Use sparingly — every listed file costs tokens.
+- On the second round, omit `needs_file`.
+
 Output strictly the following JSON object — no prose, no markdown fences
 around the JSON:
 
@@ -144,7 +205,8 @@ around the JSON:
       "confidence": "high" | "medium" | "low",
       "uncertain": "Optional. What you cannot verify from the diff."
     }
-  ]
+  ],
+  "needs_file": ["/abs/path", ...]   // optional, deep mode only, max 5
 }
 ```
 
@@ -155,13 +217,16 @@ PR title: {{title}}
 Source branch: {{sourceRefName}}
 Target branch: {{targetRefName}}
 
+{{repo_context_block_or_empty}}
+
 Diff:
 =====
 {{normalized_diff}}
 =====
 
 {{#if extra_file_context}}
-Extra file context (fetched via repo_get_file_content):
+Extra file context (fetched ad-hoc via repo_get_file_content; deep-mode
+on-demand fetches go in the Repo context block above instead):
 =====
 {{extra_file_context}}
 =====
@@ -182,7 +247,7 @@ Return only the JSON object.
 If > ~30 files or > ~3000 changed lines:
 
 1. Group files into batches of ≤ 8 files / ≤ 1500 lines.
-2. Run the system prompt per batch with the same JSON schema.
+2. Run the system prompt per batch with the same JSON schema. Prepend the same `Repo context` block to every batch (it does not vary).
 3. Concatenate `suggestions[]`, dedupe by `filePath` + `rightFileStartLine`.
 4. Cap at `max_suggestions` after concatenation, ranked per the sort order in the user prompt.
 
@@ -280,6 +345,7 @@ What you return to the user:
 - **Map-reduce honestly.** When batched, say so in the summary preview.
 - **No PII / secrets in suggestion bodies.** If the model emits an apparent token in `suggested_code` or `rationale`, redact before posting.
 - **No vote.** This skill never calls `repo_vote_pull_request`. Use `ado-pr-review` if you want a vote recommendation.
+- **Repo-context budget.** `skeleton` mode caps repo calls at 3 (tree + README + manifest); `deep` mode adds at most one re-run with up to 5 on-demand files (≤ 400 lines each). Never loop a second `needs_file` round.
 
 ---
 

@@ -10,12 +10,14 @@ Toolset header (set on the MCP server registration): `X-MCP-Toolsets: repos` —
 
 ## Per-skill tool requirements
 
+All five skills now sample target-repo context (tree skeleton + README + language manifest) by default, gated behind `--repo-context off|skeleton|deep` (default `skeleton`). That promotes `repo_list_directory` and `repo_get_file_content` to **required** on every skill — `--repo-context off` is the only mode that bypasses them.
+
 | Skill | Required tools | Optional |
 |---|---|---|
-| `ado-pr-review` | `repo_get_pull_request_by_id`, `repo_get_pull_request_changes`, `repo_list_pull_request_threads`, `repo_create_pull_request_thread`, `repo_vote_pull_request` | `repo_get_file_content` |
-| `ado-pr-describe` | `repo_get_pull_request_by_id`, `repo_get_pull_request_changes`, `repo_update_pull_request` | — |
-| `ado-pr-improve` | `repo_get_pull_request_by_id`, `repo_get_pull_request_changes`, `repo_create_pull_request_thread`, `repo_list_pull_request_threads` | `repo_get_file_content` |
-| `ado-pr-ask` | `repo_get_pull_request_by_id`, `repo_get_pull_request_changes` | `repo_create_pull_request_thread`, `repo_reply_to_comment` |
+| `ado-pr-review` | `repo_get_pull_request_by_id`, `repo_get_pull_request_changes`, `repo_list_pull_request_threads`, `repo_create_pull_request_thread`, `repo_vote_pull_request`, `repo_list_directory`, `repo_get_file_content` | — |
+| `ado-pr-describe` | `repo_get_pull_request_by_id`, `repo_get_pull_request_changes`, `repo_update_pull_request`, `repo_list_directory`, `repo_get_file_content` | — |
+| `ado-pr-improve` | `repo_get_pull_request_by_id`, `repo_get_pull_request_changes`, `repo_create_pull_request_thread`, `repo_list_pull_request_threads`, `repo_list_directory`, `repo_get_file_content` | — |
+| `ado-pr-ask` | `repo_get_pull_request_by_id`, `repo_get_pull_request_changes`, `repo_list_directory`, `repo_get_file_content` | `repo_create_pull_request_thread`, `repo_reply_to_comment` |
 | `ado-pr-test-gaps` | `repo_get_pull_request_by_id`, `repo_get_pull_request_changes`, `repo_list_directory`, `repo_get_file_content` | `repo_create_pull_request_thread`, `wit_get_work_items_batch_by_ids` |
 
 ---
